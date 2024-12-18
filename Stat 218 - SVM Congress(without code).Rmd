@@ -1,0 +1,636 @@
+---
+title: "Stat 218 - SVM Congress"
+output: html_document
+date: "2024-12-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(1)
+```
+
+## Introduction
+We chose this topic to understand what helps minority party bills succeed in Congress. With politics often feeling deeply divided, it’s useful to uncover what factors—like cosponsors, topics, or timing—can break through the partisan Senate and House gridlocks.
+
+## Data Scraping
+To get our data, we downloaded sets of 2500 rows from the US congress website. We then merged them all and added a column called "status" so we could see which bills reached what levels. The levels were the following: introduced, passed house, passed senate, failed house, failed senate, passed both, vetoed, and became law. We also played with the idea of doing some text analysis, which is looking at counts of words mentioned to see if they can give us any important insights into the whether or not the bill passes. To get the text data, we found the plain text was stored in a link that had the same pattern, with only the congress number, type of bill, number of legislation, and a coordinating suffix. We wrote a simple loop of code that would create a unique URL for each bill's text. We then created another function that went out to each of the links, copied the text, and stored it in a column called "text" we added to the end of our data set. The main limitation we faced was a crawl delay, which limits how much data you can go get from a website in a given time frame. Ours was 2 seconds, so we waited that long between each bill when we were getting the text. 
+
+In the end, we only ended up using the bill atrributes like party of sponsor, number of cosponsors, topic, and many others, instead of doing text analysis. This was mainly due to the short time frame of the project and the size of the data set. Even using a computer with a lot more data processing abilities, we were stopped from doing large scale text analysis on the whole set due to the limitations of the processing abilities of the programming interface we used, RStudio.
+
+## Datasets
+The datasets "repminor" and "demminor" were coded to examine legislative success under periods of Republican and Democratic minority status (meaning they other major party held control), respectively, within the 2017–2024 timeline. Minority party dynamics are crucial for understanding bipartisanship and legislative gridlock, as minority parties face structural challenges in advancing bills without majority control. The datasets were filtered to include bills sponsored by Republicans (repminor) and Democrats (demminor) during minority periods. For repminor, we captured two intervals: January 20, 2021, to January 20, 2022 (Republican minority in the House during the early Biden administration) and January 3, 2023, to December 31, 2024 (Republican House, Democratic Senate split government). Similarly, demminor spans January 20, 2017, to January 3, 2019, when Democrats were in the minority during the early Trump administration's unified Republican government. In democratic dataset, Status was recoded as binary (1 = "became law" or "passed both chambers"; 0 = all other outcomes). While the repminor Status column also included "passed_senate" for the 118th US Congress. 
+
+The Committee variable was split into broader committee topics by grouping related committee names using regular expressions, combining both Senate and House committees into shared dummy variables. This approach ensured that bills assigned to similar committees, regardless of chamber origin, were represented under unified topic-based dummy variables for analysis.
+
+```{r, echo = FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(ranger)
+library(e1071)
+library(data.table)
+
+```
+
+
+## General Overview Plots
+
+```{r, echo=FALSE, results="asis"}
+data_all <- fread("C:/Users/kawatson/Downloads/Final_Data.csv")
+
+data <- data.frame(data_all)
+
+#passed bill data
+passed_bills <- data |>
+  filter(Status %in% c("passed_both", "became_law")) |>
+  group_by(Party.of.Sponsor) |>
+  summarise(Passed_Bills = n(), .groups = "drop") 
+
+#plot
+passed_bills |>
+  ggplot(aes(x = Party.of.Sponsor, y = Passed_Bills, fill = Party.of.Sponsor)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = Passed_Bills), vjust = -0.5, size = 4) + # Add numbers on top of bars
+  labs(title = "Number of Bills Passed by Party",
+    x = "Party of Sponsor", y = "Number of Bills Passed") +
+  scale_fill_manual(values = c("Democratic" = "darkblue", "Republican" = "darkred")) +
+  theme_minimal()
+
+#bill data and plot
+submission_summary <- data |>
+  group_by(Party.of.Sponsor) |>
+  summarise(
+    Submitted_Bills = n(), # Total number of submitted bills
+    Passed_Bills = sum(Status %in% c("passed_both", "became_law")),
+    .groups = "drop") |>
+  mutate(Submit_to_Pass_Ratio = Passed_Bills / Submitted_Bills)
+
+submission_summary |>
+  ggplot(aes(x = Party.of.Sponsor, y = Submit_to_Pass_Ratio, fill = Party.of.Sponsor)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  scale_fill_manual(values = c("Democratic" = "darkblue", "Republican" = "darkred")) +
+  labs(title = "Submitted-to-Passed Ratio by Party", x = "Party of Sponsor", y = "Ratio") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  geom_text(aes(label = scales::percent(Submit_to_Pass_Ratio, accuracy = 0.1)), 
+            vjust = -0.5, size = 4)
+
+#topic summary and plot
+topic_summary <- data |>
+  pivot_longer(
+    cols = starts_with("Topic_"),
+    names_to = "Topic",
+    values_to = "Count") |>
+  group_by(Party.of.Sponsor, Topic) |>
+  summarise(Total_Bills = sum(Count, na.rm = TRUE), .groups = "drop") |>
+  mutate(Topic = gsub("Topic_", "", Topic)) # Remove the "Topic_" prefix for better readability
+
+topic_summary |>
+  ggplot(aes(x = reorder(Topic, Total_Bills), y = Total_Bills, fill = Party.of.Sponsor)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Party.of.Sponsor) +  # Use fixed y-axis scaling
+  scale_fill_manual(values = c("Democratic" = "darkblue", "Republican" = "darkred")) +
+  labs(title = "Most Popular Topics Among Republicans and Democrats",
+       x = "Topic",
+       y = "Total Bills",
+       fill = "Party") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 6))  # Keep the smaller font size for x-axis labels
+
+
+
+```
+
+### What party has more bills passed? What party has a greater introduced-to-passed ratio?
+The initial analysis of the sample reveals that while Republicans sponsored more bills overall (563 compared to 414 for Democrats), the Democratic bills had a higher success rate, with 31.3% being passed compared to 26.0% for Republicans. This disparity may suggest that Democratic bills may have been more strategically aligned with bipartisan priorities or legislative feasibility, even during minority periods. 
+
+### What are the most common topics among all the bills?
+Transportation Infrastructure emerged as a shared priority for both parties, reflecting its bipartisan appeal and importance for economic growth. Republicans heavily emphasized topics like Banking, Housing, Urban Affairs, and Rules Oversight, aligning with their focus on regulatory reform and fiscal accountability. Democrats, on the other hand, were more active in areas like Judiciary, Healthcare, Education, and Veterans Affairs, highlighting their attention to justice-related policies and support for citizens' welfare. 
+
+### What is a Random Forest Model?
+A Random Forest is a machine learning model used for classification or regression tasks. It is built upon a concept called decision trees, but instead of relying on a single decision tree, Random Forest creates a "forest" of many decision trees to make predictions.
+
+Think of each decision tree as a "path" to make a decision. Each decision tree looks at the data, splits it based on certain variables (or "features"), and makes a prediction. Random Forest combines the results of all these trees to come up with a final prediction.
+
+### Why did we use Random Forest? 
+We used Random Forest because it is well-suited for identifying the most important features driving legislative success, particularly when working with a mix of categorical and numerical variables. Its ability to handle non-linear relationships and interactions between predictors allowed us to establish which bill characteristics—such as specific topics (e.g., Appropriations, Judiciary) or sponsor features (e.g., cosponsorship patterns)—were most predictive of success. Additionally, Random Forest reduces overfitting by averaging results across multiple decision trees, and its built-in feature importance scores shows us which variables have the most impact and enable us to pinpoint bipartisan or non-partisan topics and other factors that increase a bill's likelihood of passing.
+
+## Variable Importance Democratic Minority Bills
+```{r, echo=FALSE, results="asis"}
+#dataset of democratic minority bills
+demminor <- data |>
+  filter(Date.of.Introduction >= as.Date("2017-01-20") & Date.of.Introduction <= as.Date("2019-01-03") & 
+           Party.of.Sponsor == "Democratic") |>
+  select(Status, Number.of.Related.Bills, Number.of.Cosponsors, Legislation.Type, starts_with("Topic_")) |>
+  mutate(Status = ifelse(Status %in% c("became_law", "passed_both"), 1, 0))
+
+#topic analysis
+topics_analysis1 <- demminor |>
+  filter(Status == 1) |>
+  summarise(across(starts_with("Topic_"), sum, na.rm = TRUE)) |>
+  pivot_longer(
+    cols = starts_with("Topic_"),
+    names_to = "Topic",
+    values_to = "Passed_Bills") |>
+  mutate(Topic = gsub("Topic_", "", Topic)) |>
+  arrange(desc(Passed_Bills))
+
+#ggplot graphs of topics with most bills passed
+ggplot(topics_analysis1, aes(x = reorder(Topic, Passed_Bills), y = Passed_Bills)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  coord_flip() +
+  labs(title = "Topics with Most Passed Bills (Dem Sponsored, 115 Congress)",
+       x = "Topic", y = "Number of Passed Bills") +
+  theme_minimal()
+
+#create training and test sets (0.7 to 0.3)
+set.seed(1)
+train_index_d <- createDataPartition(demminor$Status, p = 0.7, list = FALSE)
+train_data_d <- demminor[train_index_d, ]
+test_data_d <- demminor[-train_index_d, ]
+
+train_data_d$Status <- as.factor(train_data_d$Status)
+test_data_d$Status <- as.factor(test_data_d$Status)
+
+topic_columns_d <- colnames(demminor)[grepl("^Topic_", colnames(demminor))]
+
+
+#train the Random Forest model including topic dummies (-taxes, house admin, homeland sec, foreign affairs, small business, Indian affairs, energy commerce)
+rf_model_d <- randomForest(Status ~ Number.of.Cosponsors + Number.of.Related.Bills + Legislation.Type + Topic_Health_Education_Labor_Pensions + Topic_Transportation_Infrastructure + Topic_Judiciary + Topic_Rules_Oversight + Topic_Veterans_Affairs + Topic_Finance + Topic_Armed_Services + Topic_Agriculture + Topic_Budget + Topic_Intelligence + Topic_Banking_Housing_UrbanAffairs + Topic_Appropriations  + Topic_Environment_PublicWorks, 
+  data = train_data_d[, c("Status", "Number.of.Cosponsors", "Number.of.Related.Bills", "Legislation.Type", topic_columns_d)],
+  importance = TRUE,
+  ntree = 1000)
+
+#test predictions
+test_predictions_d <- predict(rf_model_d, newdata = test_data_d)
+
+#accuracy
+accuracy_d <- mean(test_predictions_d == test_data_d$Status)
+
+print(paste("Accuracy:", round(accuracy_d * 100, 2), "%"))
+
+#plot importance factors
+importance_d <- as.data.frame(rf_model_d$importance) |>
+  rownames_to_column(var = "Variable") |>
+  arrange(desc(MeanDecreaseGini)) 
+
+importance_d |>
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  coord_flip() +
+  labs(title = "Bi/Non-partisan Factors in Democratic Bills", x = "Factor", y = "Mean Decrease in Gini (Variable Importance)")
+```
+
+### 1st graph, Topics for Most Passed Bills:
+The data shows that Democratic-sponsored bills in the 115th Congress most frequently succeeded in broad, less partisan topics like Transportation Infrastructure and Rules Oversight, while more controversial or specialized areas saw little to no success. The dominance of the "Other" category suggests a significant share of passed bills addressed procedural or niche issues that did not fall into standard committee topics, likely making them less contentious.
+
+### 2nd graph, Variable Importance:
+The Random Forest model achieved an accuracy of 66.14%, highlighting its moderate ability to predict which Democratic-sponsored bills are likely to pass. The top predictors of success include the Number of Cosponsors and the Number of Related Bills, emphasizing the importance of building legislative coalitions and interconnected bill support. Additionally, topics like Transportation Infrastructure, Rules Oversight, and Veterans Affairs emerged as key bipartisan areas.
+
+
+## Republican Variable Importance
+```{r , echo=FALSE, results="asis"}
+#create republican set
+date_range1_start <- as.Date("2021-01-20")
+date_range1_end <- as.Date("2022-01-20")
+date_range2_start <- as.Date("2023-01-03")
+date_range2_end <- as.Date("2024-12-31") 
+
+#create republican minority set
+repminor <- data |>
+  filter((Date.of.Introduction >= date_range1_start & Date.of.Introduction <= date_range1_end) |
+    (Date.of.Introduction >= date_range2_start & Date.of.Introduction <= date_range2_end),
+    Party.of.Sponsor == "Republican") |>
+  select(Date.of.Introduction, Status, Number.of.Cosponsors, Number.of.Related.Bills, Legislation.Type, starts_with("Topic_")) |>
+  mutate(Status = ifelse(Status %in% c("became_law", "passed_both"), 1, 
+                         ifelse(Date.of.Introduction >= date_range2_start & Date.of.Introduction <= date_range2_end & Status == "passed_house", 1, 0))) |>
+  mutate(across(c(Legislation.Type), as.factor))
+
+#topic analysis
+topics_analysis2 <- repminor |>
+  filter(Status == 1) |>
+  summarise(across(starts_with("Topic_"), sum, na.rm = TRUE)) |>
+  pivot_longer(
+    cols = starts_with("Topic_"), names_to = "Topic", values_to = "Passed_Bills") |>
+  mutate(Topic = gsub("Topic_", "", Topic)) |>
+  arrange(desc(Passed_Bills))
+
+#plot topic analysis
+ggplot(topics_analysis2, aes(x = reorder(Topic, Passed_Bills), y = Passed_Bills)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(title = "Topics with Most Passed Bills (Republican Sponsored)",
+       x = "Topic", y = "Number of Passed Bills") +
+  theme_minimal()
+
+#Create training and testing sets
+set.seed(2)
+train_index_r <- createDataPartition(repminor$Status, p = 0.7, list = FALSE)
+train_data_r <- repminor[train_index_r, ]
+test_data_r <- repminor[-train_index_r, ]
+
+train_data_r$Status <- as.factor(train_data_r$Status)
+test_data_r$Status <- as.factor(test_data_r$Status)
+
+#identify topic columns
+topic_columns_r <- colnames(repminor)[grepl("^Topic_", colnames(repminor))]
+
+#train the Random Forest model including topic dummies
+rf_model_r <- randomForest(Status ~ Number.of.Cosponsors + Number.of.Related.Bills + Legislation.Type + Topic_Health_Education_Labor_Pensions + Topic_Transportation_Infrastructure + Topic_Judiciary + Topic_Rules_Oversight + Topic_Veterans_Affairs + Topic_Finance + Topic_Armed_Services + Topic_Agriculture + Topic_Budget + Topic_Banking_Housing_UrbanAffairs + Topic_Appropriations  + Topic_Environment_PublicWorks, 
+  data = train_data_r[, c("Status", "Number.of.Cosponsors", "Number.of.Related.Bills", "Legislation.Type", topic_columns_r)],
+  importance = TRUE,
+  ntree = 1000)
+
+#test for accuracy
+test_predictions_r <- predict(rf_model_r, newdata = test_data_r)
+
+accuracy_r <- mean(test_predictions_r == test_data_r$Status)
+print(paste("Accuracy:", round(accuracy_r * 100, 2), "%"))
+
+
+#plot importance
+importance_df_r <- as.data.frame(rf_model_r$importance) |>
+  rownames_to_column(var = "Variable") |>
+  arrange(desc(MeanDecreaseGini)) # Use the correct column name
+
+importance_df_r |>
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(title = "Bi/Non-partisan Factors in Republican Bills", x = "Factor", y = "Mean Decrease in Gini (Variable Importance")
+```
+
+#### 1st graph, Topics for most passed bills:
+Republican-sponsored bills show significant success in Transportation Infrastructure and Judiciary, reflecting a focus on topics with broad appeal and clear governance priorities. The high number of passed bills in Banking, Housing, and Urban Affairs and Veterans Affairs highlights their emphasis on economic policy and support for military communities. While Democrats also succeeded in Transportation Infrastructure, Republicans had a broader spread of passed bills across Finance and Health Education Labor Pensions, suggesting a focus on practical, bipartisan issues.
+
+#### 2nd graph, variable importance:
+The Random Forest model for Republican-sponsored bills achieved a high accuracy of 79.08%, likely due to the larger sample size in the repminor dataset. Just like with Democratic bills, key predictors of success include Legislation Type, Number of Cosponsors, and Number of Related Bills, emphasizing the importance of coalition-building and interconnected legislative efforts. Additionally, topics like Veterans Affairs and Judiciary emerged as significant factors.
+
+## Bills Passed by Party and Type
+```{r, echo=FALSE, results="asis"}
+#create combined set
+ combined_data <- bind_rows(
+  repminor |> mutate(Group = "Republican Minority"),
+  demminor |> mutate(Group = "Democratic Minority"))
+
+passed_bills <- combined_data |> filter(Status == 1)
+
+#plot types of legislation passed in minority periods
+passed_bills |>
+ggplot(aes(x = Legislation.Type, fill = Group)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Group) +
+  scale_fill_manual(values = c("Democratic Minority" = "darkblue", 
+                               "Republican Minority" = "darkred")) +
+  labs(title = "Types of Legislation for Passed Bills in Minority Periods",
+       x = "Legislation Type", y = "Number of Passed Bills", fill = "Group") +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1),
+    strip.text = element_text(face = "bold", size = 12))
+```
+
+Republicans overwhelmingly succeeded with House Resolutions (H.R.), reflecting a strategy focused on advancing legislation in the House, where they could leverage procedural influence despite their minority status. In contrast, Democrats passed fewer H.R. bills but saw a relatively higher proportion of Senate bills (S.), indicating efforts to collaborate across chambers during their minority periods. 
+
+
+### What is a Support Vector Machine (SVM) and why did we use it?
+Since we are working with a large number of features derived from tokenized bill texts, the data becomes high-dimensional (meaning there are many variables to consider). High-dimensional datasets can be challenging because traditional machine learning models may struggle to find patterns without making errors like "overfitting"—essentially fitting too closely to the training data and failing to generalize well to new, unseen data. For this reason, we selected Support Vector Machines (SVM) for our analysis.
+
+SVM compares favorably to other models, particularly for high-dimensional datasets like ours, where tokenized bill texts introduce many features. Unlike decision trees or random forests, which can struggle with overfitting in high-dimensional spaces, SVM effectively handles large feature spaces by focusing on finding the optimal margin between categories. SVM is more robust when data is not perfectly linearly separable, thanks to its ability to use kernel functions to map data into higher dimensions for better separation. Kernels transform the data into a new space where drawing a clear boundary between categories becomes easier, even if the original data looks tangled or curved.
+
+### Interpreting Results
+A confusion matrix is a table used to evaluate the performance of a classification model by comparing its predicted outcomes to the actual results. It displays four key components: True Positives (TP), True Negatives (TN), False Positives (FP), and False Negatives (FN). TP refers to the cases where the model correctly predicts a positive outcome, while TN refers to correctly predicting a negative outcome. FP occurs when the model incorrectly predicts a positive outcome, and FN occurs when it fails to predict a positive outcome. Metrics like accuracy, sensitivity, specificity, and precision can be calculated from these values to measure how well the model performs. The confusion matrix is essential for diagnosing errors, assessing model bias, and understanding how well a model identifies different classes, especially when dealing with imbalanced data.
+
+## SVM for Republicans
+```{r, echo=FALSE, results="asis"}
+#republican datast
+repminor <- repminor |>
+  mutate(Status = as.factor(Status))
+set.seed(5) 
+train_indices_rr <- sample(1:nrow(repminor), 0.7 * nrow(repminor)) 
+train_data_rr <- repminor[train_indices_rr, ]
+test_data_rr <- repminor[-train_indices_rr, ]
+
+#create SVM
+svm_model_r <- svm(Status ~ Number.of.Cosponsors + Number.of.Related.Bills + Legislation.Type  + Topic_Health_Education_Labor_Pensions + Topic_Transportation_Infrastructure + Topic_Judiciary + Topic_Rules_Oversight + Topic_Veterans_Affairs + Topic_Finance + Topic_Armed_Services + Topic_Agriculture + Topic_Budget + Topic_Banking_Housing_UrbanAffairs + Topic_Appropriations + Topic_Environment_PublicWorks,
+  data = train_data_rr,
+  kernel = "linear",  
+  probability = TRUE)
+
+svm_predictions_r <- predict(svm_model_r, newdata = test_data_rr, probability = TRUE)
+
+#accuracy
+confusion_matrix_r <- table(Predicted = svm_predictions_r, Actual = test_data_rr$Status)
+accuracy <- sum(diag(confusion_matrix_r)) / sum(confusion_matrix_r)
+
+cat("Confusion Matrix:\n")
+print(confusion_matrix_r)
+cat("Model Accuracy:", accuracy, "\n")
+```
+Our republican SVM predicts all classes and has an overall accuracy of about 77%. This means that it is correct 77% of the time and it is not just guessing one thing if that is a majority class.
+
+## SVM Republican Minority
+```{r, echo=FALSE, results="asis"}
+#republican data
+repminor_text <- repminor |> 
+  mutate(Status = as.factor(Status)) |> 
+  select(-Topic_Intelligence)
+
+#extract word columns (excluding "Status")
+word_columns <- setdiff(colnames(repminor_text), "Status")
+
+#split data into training and test sets
+set.seed(10)  # For reproducibility
+train_indices_textr <- sample(1:nrow(repminor_text), 0.7 * nrow(repminor_text)) 
+train_data_textr <- repminor_text[train_indices_textr, ]
+test_data_textr <- repminor_text[-train_indices_textr, ] 
+
+#train SVM model with a linear kernel
+svm_model_textr <- svm(Status ~ .,  
+  data = train_data_textr[, c("Status", word_columns)],
+  kernel = "linear",  
+  scale = TRUE,       
+  probability = TRUE
+)
+
+#make predictions and calculate accuracy
+svm_predictions_textr <- predict(svm_model_textr, 
+                                 newdata = test_data_textr[, c("Status", word_columns)], 
+                                 probability = TRUE)
+confusion_matrix_textr <- table(Predicted = svm_predictions_textr, Actual = test_data_textr$Status)
+accuracy_textr <- sum(diag(confusion_matrix_textr)) / sum(confusion_matrix_textr)
+
+cat("\n==== SVM Results for Republican Bills (Minority Periods) ====\n")
+cat("Confusion Matrix:\n")
+print(confusion_matrix_textr)
+cat("Model Accuracy:", round(accuracy_textr, 4), "\n")
+
+#feature importance
+svm_coefs_textr <- as.vector(t(svm_model_textr$coefs) %*% svm_model_textr$SV)
+
+#pair coefficients with corresponding feature names and sort
+feature_importance_textr <- data.frame(
+  Feature = word_columns[1:length(svm_coefs_textr)],  # Align features to coefficients
+  Coefficient = svm_coefs_textr
+) |>
+  na.omit() |>                      # Remove any NA rows
+  arrange(desc(abs(Coefficient)))   # Sort by absolute coefficient value
+
+#pull out top features
+print(head(feature_importance_textr, 10))
+      
+#plot the top 50 features by importance
+top_n_words_textr <- 50  
+top_words_textr <- head(feature_importance_textr, top_n_words_textr)
+
+top_words_textr |>
+  ggplot(aes(x = reorder(Feature, abs(Coefficient)), y = abs(Coefficient))) +
+  geom_bar(stat = "identity", fill = "darkred") +
+  coord_flip() +
+  labs(
+    title = "Top Influences of Republican Bill Passage (Minority Periods)",
+    x = "Words",
+    y = "Importance (Absolute SVM Coefficient)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The republican minority data is a bit easier to predict than the democratic minority since more republican bills pass in minority settings. The model predicts all classes and is around 75% accurate overall.
+
+Republican minority bills from the Rules, Oversight, and Accountability Committees are more likely to pass because these committees focus on procedural governance, transparency, and agency accountability. However, while the committee also oversees impeachment processes, which tend to be highly partisan, its other responsibilities often allow bipartisan support on less controversial issues.Additionally, topics like Transportation Infrastructure, Budget, and Appropriations stand out, indicating that Republicans effectively prioritized fiscal and infrastructural issues during these periods.
+
+
+## SVM for Democrats
+```{r, echo=FALSE, results="asis"}
+#dem ata
+demminor <- demminor |> mutate(Status = as.factor(Status))
+
+#class distribution
+cat("Class distribution:\n")
+print(table(demminor$Status))
+
+#split training and test
+set.seed(5) 
+train_indices_dd <- sample(1:nrow(demminor), 0.7 * nrow(demminor))
+train_data_dd <- demminor[train_indices_dd, ]
+test_data_dd <- demminor[-train_indices_dd, ]
+
+#levels
+train_data_dd$Legislation.Type <- factor(train_data_dd$Legislation.Type)
+test_data_dd$Legislation.Type <- factor(test_data_dd$Legislation.Type, levels = levels(train_data_dd$Legislation.Type))
+
+#normalize
+scaled_train_features <- scale(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")])
+scaled_test_features <- scale(test_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")], 
+                               center = colMeans(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")]), 
+                               scale = apply(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")], 2, sd))
+
+#combine
+train_data_dd <- cbind(Status = train_data_dd$Status, 
+                        scaled_train_features, 
+                        train_data_dd[, setdiff(colnames(train_data_dd), c("Number.of.Cosponsors", 
+                                                      "Number.of.Related.Bills"))])
+
+test_data_dd <- cbind(scaled_test_features, 
+                       test_data_dd[, setdiff(colnames(test_data_dd), c("Number.of.Cosponsors", 
+                                                      "Number.of.Related.Bills"))])
+
+#class weights
+class_weights <- list("0" = 1, "1" = 5)  # Penalize misclassification of the minority class more heavily
+
+#train the SVM model with radial kernel, class weights, and normalization
+svm_model_d <- svm(Status ~ Number.of.Cosponsors + Number.of.Related.Bills + Legislation.Type + 
+                      Topic_Health_Education_Labor_Pensions + Topic_Transportation_Infrastructure +
+                      Topic_Judiciary + Topic_Rules_Oversight + Topic_Veterans_Affairs +
+                      Topic_Finance + Topic_Armed_Services + Topic_Agriculture + 
+                      Topic_Budget + Topic_Banking_Housing_UrbanAffairs + Topic_Appropriations +
+                      Topic_Environment_PublicWorks,
+                    data = train_data_dd,
+                    kernel = "radial",
+                    scale = FALSE,
+                    probability = TRUE,
+                    class.weights = class_weights)
+
+#predictions
+svm_predictions_d <- predict(
+  svm_model_d,
+  newdata = test_data_dd,
+  probability = TRUE
+)
+
+#probabilities
+predicted_prob <- attr(svm_predictions_d, "probabilities")[, 2]
+
+#decision threshold to improve sensitivity
+threshold <- 0.3  #lower the default threshold to improve model's sensitivity for class 1
+predicted_class <- ifelse(predicted_prob > threshold, "1", "0")
+
+#cConfusion matrix evaluation
+confusion_matrix_d <- table(Predicted = predicted_class, Actual = test_data_dd$Status)
+
+#model accuracy
+accuracy <- sum(diag(confusion_matrix_d)) / sum(confusion_matrix_d)
+
+cat("\nConfusion Matrix:\n")
+print(confusion_matrix_d)
+cat("\nModel Accuracy:", round(accuracy, 4), "\n")
+
+#evaluate sensitivity (recall) for minority class
+sensitivity <- confusion_matrix_d["1", "1"] / sum(confusion_matrix_d[, "1"])
+cat("\nSensitivity for the minority class (Class 1):", round(sensitivity, 4), "\n")
+
+#feature importance
+svm_coefs_d <- as.vector(t(svm_model_d$coefs) %*% svm_model_d$SV)
+
+feature_importance_d <- data.frame(
+  Feature = colnames(train_data_dd)[1:(length(svm_coefs_d))], 
+  Coefficient = svm_coefs_d
+) |> 
+  na.omit() |> 
+  arrange(desc(abs(Coefficient)))
+
+#top features
+top_n_features_d <- 50
+top_features_d <- head(feature_importance_d, top_n_features_d)
+
+#plot
+ggplot(top_features_d, aes(x = reorder(Feature, abs(Coefficient)), y = abs(Coefficient))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top Influences of Democratic Bill Passage",
+    x = "Features",
+    y = "Importance (SVM Coefficient)"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+Since very few bills passed, there is an imbalance in the two "classes" that means the model does not have a lot of data to go off of to predict when a bill passes. To deal with that, we have used class weights to try to make the model have more information to predict when a democratic bill will pass.
+
+
+## SVM Democratic Minority
+```{r, echo=FALSE, results="asis"}
+#democratic minority data
+demminor <- demminor |> mutate(Status = as.factor(Status))
+
+#class distribution
+cat("Class distribution:\n")
+print(table(demminor$Status))
+
+#train and test split
+set.seed(5) 
+train_indices_dd <- sample(1:nrow(demminor), 0.7 * nrow(demminor))
+train_data_dd <- demminor[train_indices_dd, ]
+test_data_dd <- demminor[-train_indices_dd, ]
+
+#deal with levels in 'Legislation.Type'
+train_data_dd$Legislation.Type <- factor(train_data_dd$Legislation.Type)
+test_data_dd$Legislation.Type <- factor(test_data_dd$Legislation.Type, levels = levels(train_data_dd$Legislation.Type))
+
+#normalize predictors
+scaled_train_features <- scale(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")])
+scaled_test_features <- scale(test_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")], 
+                               center = colMeans(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")]), 
+                               scale = apply(train_data_dd[, c("Number.of.Cosponsors", "Number.of.Related.Bills")], 2, sd))
+
+#as numric
+train_data_dd$Legislation.Type <- as.numeric(train_data_dd$Legislation.Type)
+test_data_dd$Legislation.Type <- as.numeric(test_data_dd$Legislation.Type)
+
+# class weights to better balance the minority class impact
+class_weights <- list("0" = 1, "1" = 10)  # Heavily penalize misclassification of class "1"
+
+#train SVM model with the radial kernel and adjusted class weights
+svm_model_d <- svm(
+  Status ~ Number.of.Cosponsors + Number.of.Related.Bills + Legislation.Type + 
+    Topic_Health_Education_Labor_Pensions + Topic_Transportation_Infrastructure +
+    Topic_Judiciary + Topic_Rules_Oversight + Topic_Veterans_Affairs +
+    Topic_Finance + Topic_Armed_Services + Topic_Agriculture + 
+    Topic_Budget + Topic_Banking_Housing_UrbanAffairs + Topic_Appropriations +
+    Topic_Environment_PublicWorks,
+  data = as.data.frame(cbind(
+    Status = train_data_dd$Status, 
+    scaled_train_features, 
+    train_data_dd[, setdiff(colnames(train_data_dd), c("Number.of.Cosponsors", 
+                                                      "Number.of.Related.Bills"))]
+  )),
+  kernel = "radial",  # Radial kernel is more flexible with non-linear relationships
+  scale = FALSE,
+  probability = TRUE,
+  class.weights = class_weights  # Include weights to handle imbalance
+)
+
+#predict on the test set
+svm_predictions_d <- predict(
+  svm_model_d,
+  newdata = as.data.frame(cbind(
+    scaled_test_features, 
+    test_data_dd[, setdiff(colnames(test_data_dd), c("Number.of.Cosponsors", 
+                                                      "Number.of.Related.Bills"))]
+  )),
+  probability = TRUE
+)
+
+#probabilities for the minority class
+predicted_prob <- attr(svm_predictions_d, "probabilities")[,2]
+
+#decision threshold instead of default 0.5 (try lowering or tuning it)
+threshold <- 0.3  # New threshold to make the model more sensitive to class "1"
+predicted_class <- ifelse(predicted_prob > threshold, "1", "0")
+confusion_matrix_d <- table(Predicted = predicted_class, Actual = test_data_dd$Status)
+
+#accuracy
+accuracy <- sum(diag(confusion_matrix_d)) / sum(confusion_matrix_d)
+
+cat("\nConfusion Matrix:\n")
+print(confusion_matrix_d)
+cat("\nModel Accuracy:", round(accuracy, 4), "\n")
+
+#eval sensitivity for the minority class
+sensitivity <- confusion_matrix_d["1", "1"] / sum(confusion_matrix_d[, "1"])
+cat("\nSensitivity for the minority class (Class 1):", round(sensitivity, 4), "\n")
+
+#feature importance
+svm_coefs_d <- as.vector(t(svm_model_d$coefs) %*% svm_model_d$SV)
+
+feature_importance_d <- data.frame(
+  Feature = colnames(train_data_dd)[1:(length(svm_coefs_d))], 
+  Coefficient = svm_coefs_d
+) |>
+  na.omit() |> 
+  arrange(desc(abs(Coefficient)))
+
+#top features visualization
+top_n_features_d <- 50
+top_features_d <- head(feature_importance_d, top_n_features_d)
+
+#plot
+ggplot(top_features_d, aes(x = reorder(Feature, abs(Coefficient)), y = abs(Coefficient))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top Influences of Democratic Bill Passage (Minority Periods)",
+    x = "Words",
+    y = "Importance (Absolute SVM Coefficient)"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+### Democratic Minority SVM Overview
+Democratic minority bills are strongly influenced by Judiciary and Agriculture topics, which likely reflect areas with procedural importance and bipartisan appeal, such as judicial appointments or rural policy initiatives. Additionally, topics like Banking, Housing, and Urban Affairs, as well as Environment and Public Works, indicate a Democratic focus on financial oversight, housing stability, and infrastructure improvements. These priorities align with broader Democratic legislative goals that may garner cross-party support even in minority periods.
+
+### Additonal Training for Democratic Models 
+Several key adjustments were made to improve the SVM model's performance and ensure it better predicts both outcomes (passage or failure of bills) rather than focusing solely on one class. First, we changed the kernel type from a simple linear kernel to a radial kernel, which allows the model to capture more complex, non-linear relationships in the data. This change gives the model the flexibility to account for interactions between features that may not follow a straight-line pattern. Second, we implemented class weighting, assigning higher penalties to the minority class (bills that pass, denoted by "1"). This adjustment ensures that the SVM doesn't disproportionately predict the majority class (bills that fail) by making it "costlier" for the model to misclassify successful bills. Lastly, we carefully normalized numeric features like the number of cosponsors and the number of related bills, which helps the SVM treat these numbers on an equal footing and improves convergence during training. Together, these tweaks enhance the SVM's ability to learn meaningful patterns and improve overall prediction balance.
+
+### Conclusion
+Our analysis explored the dynamics of minority party bill success in Congress by examining Republican and Democratic-sponsored bills during their respective minority periods. Through data analysis and machine learning models like Random Forest and SVM, we assessed the key factors driving legislative success, such as cosponsorships, legislation type, and topic areas. The initial findings revealed that while Republicans introduced more bills overall, Democrats had a higher success rate, with their bills more strategically aligned with bipartisan priorities. Using Random Forest, we identified influential features like Transportation Infrastructure, Rules Oversight, and Veterans Affairs as common predictors of success. When incorporating machine learning techniques like SVM, we found even higher accuracy rates (74.2% for Democrats and 76.7% for Republicans) in predicting legislative outcomes, showcasing the predictive power of these models.
+
+The analysis highlights distinct priorities for each party during their minority periods. Republicans focused on procedural governance and economic priorities such as Transportation Infrastructure, Banking, and Housing, while Democrats prioritized Judiciary, Agriculture, and environmental topics, reflecting bipartisan legislative goals. These insights demonstrate that strategic priorities, coalition-building, and topic selection play a vital role in breaking through legislative gridlocks. Through this research, we better understand the structural challenges faced by minority parties and the strategies they employ to advance legislative priorities in a divided Congress.
+
+
+
+
