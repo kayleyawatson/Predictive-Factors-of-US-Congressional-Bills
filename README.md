@@ -8,3 +8,5 @@ After conducting a comprehensive web scraping process, we applied a combination 
 To Interact with our study, we have included 4 main files. The dataset, our coding script that is downloadable and editable, and two versions of our final report: one with code included and another without.
 
 All data was sourced from the following website: [https://www.congress.gov/](url)
+
+Since our dataset file was too large to upload here, we have added it to a publicly viewable google drive folder for download: [https://drive.google.com/drive/folders/12bEeE8swmK3CmfnG8wQ4WaCVoJqTNRwH?usp=sharing](url)
